@@ -1,5 +1,200 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>数字凭证 · 一次性核验</title>
+<style>
+  body{font:15px/1.6 system-ui;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2933}
+  h1{margin-bottom:4px} h2{margin-top:34px;border-bottom:2px solid #e4e7eb;padding-bottom:6px}
+  .muted{color:#6b7280} code{background:#f3f5f7;padding:1px 5px;border-radius:4px}
+  .bar{background:#f3f5f7;padding:12px 14px;border-radius:8px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  input,select,textarea{font:inherit;padding:6px 9px;border:1px solid #cbd2d9;border-radius:6px}
+  input[type=text],input[type=number],textarea{min-width:200px}
+  button{padding:7px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
+  button.ghost{background:#e4e7eb;color:#1f2933} button.danger{background:#b91c1c} button:disabled{opacity:.45;cursor:default}
+  table{border-collapse:collapse;width:100%;margin-top:10px;font-size:14px}
+  th,td{border:1px solid #e4e7eb;padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f8fafc}
+  .pill{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px}
+  .s-pending{background:#fef3c7}.s-approved{background:#dbeafe}
+  .s-consumed{background:#dcfce7}.s-withdrawn,.s-expired{background:#fee2e2}
+  .g-voided,.g-consumed{color:#b91c1c}
+  pre{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;overflow:auto;min-height:42px;white-space:pre-wrap}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+</style>
+<h1>数字凭证 · 核验申请与一次性出示</h1>
+<p class="muted">核验方登记用途与拟看字段；持有人同意后生成只能使用一次的结果凭证，兑付成功即失效。身份由 <code>X-Actor</code> / <code>X-Role</code> 请求头模拟。</p>
+
+<div class="bar">
+  <strong>当前身份</strong>
+  <select id="role">
+    <option value="verifier">verifier 核验方</option>
+    <option value="holder">holder 持有人</option>
+    <option value="issuer">issuer 签发方</option>
+  </select>
+  <input id="actor" type="text" placeholder="身份标识，如 alice / bank-1" style="min-width:260px">
+  <button class="ghost" onclick="loadAll()">刷新全部</button>
+</div>
+
+<h2>① 核验方登记核验申请</h2>
+<div class="row">
+  <select id="credential"></select>
+  <input id="purpose" type="text" placeholder="核验用途，如：开户实名核验" style="min-width:240px">
+  <input id="fields" type="text" placeholder="拟看字段，逗号分隔：name,program">
+  <input id="ttl" type="number" value="30" min="1" max="10080" style="min-width:90px"> 分钟
+  <button onclick="createRequest()">提交申请</button>
+</div>
+<p class="muted" id="requestHint"></p>
+
+<h2>② 核验申请（持有人同意 / 撤回）</h2>
+<table>
+  <thead><tr><th>ID</th><th>凭证</th><th>持有人</th><th>核验方</th><th>用途</th><th>字段</th><th>状态</th><th>到期</th><th>操作 / 一次性凭证</th></tr></thead>
+  <tbody id="requests"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+</table>
+
+<div class="grid">
+  <div>
+    <h2>③ 核验方一次性兑付</h2>
+    <div class="row"><textarea id="token" rows="5" style="width:100%;min-width:0" placeholder="粘贴同意后生成的一次性结果凭证"></textarea></div>
+    <div class="row">
+      <input id="redeemFields" type="text" placeholder="本次实际查看字段（留空=同意范围全部）" style="flex:1">
+      <button onclick="redeem()">兑付核验</button>
+    </div>
+    <pre id="redeemResult" class="muted">结果将显示在这里</pre>
+  </div>
+  <div>
+    <h2>④ 核验记录（事后可查）</h2>
+    <table>
+      <thead><tr><th>时间</th><th>申请</th><th>核验方</th><th>用途</th><th>查看字段与值</th></tr></thead>
+      <tbody id="records"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<h2>服务原始状态</h2>
+<button class="ghost" onclick="loadState()">刷新状态</button>
+<pre id="state" class="muted"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function headers(extra){ return Object.assign({'Content-Type':'application/json'}, extra); }
+function authHeaders(extra){
+  const h = headers(extra);
+  h['X-Actor'] = $('actor').value.trim();
+  h['X-Role'] = $('role').value;
+  return h;
+}
+async function api(path, opts){
+  const resp = await fetch(path, opts);
+  const data = await resp.json().catch(() => ({}));
+  if(!resp.ok) throw Object.assign(new Error(data.error || ('HTTP ' + resp.status)), {status: resp.status});
+  return data;
+}
+
+async function loadState(){
+  const data = await api('/api/state');
+  $('state').textContent = JSON.stringify(data, null, 2);
+  const select = $('credential');
+  select.innerHTML = data.credentials.map(c =>
+    `<option value="${c.id}">#${c.id} ${esc(c.holder_id)} · ${esc(data.templates.find(t=>t.id===c.template_id)?.code || c.template_id)} · ${esc(c.status)}</option>`
+  ).join('') || '<option value="">暂无凭证（需先签发）</option>';
+  return data;
+}
+
+async function loadRequests(){
+  const data = await api('/api/verification/requests', {headers: authHeaders()});
+  const role = $('role').value, actor = $('actor').value.trim();
+  $('requests').innerHTML = data.requests.map(r => {
+    const g = r.grant;
+    let action;
+    if(role === 'holder' && actor === r.holder_id && r.status === 'pending'){
+      action = `<button onclick="consent(${r.id})">同意并生成凭证</button>
+                <button class="danger" onclick="withdraw(${r.id})">撤回</button>`;
+    } else if(role === 'holder' && actor === r.holder_id && r.status === 'approved'){
+      action = `<button class="danger" onclick="withdraw(${r.id})">撤回同意</button>`;
+    } else if(role === 'verifier' && g && g.status === 'available'){
+      action = `<button class="ghost" onclick="useToken(${r.id})">取用凭证</button>`;
+    } else {
+      action = '<span class="muted">—</span>';
+    }
+    const grantInfo = g
+      ? `<div class="muted">授权：<span class="g-${g.status}">${esc(g.status)}</span> · 字段 ${esc(g.approved_fields.join(','))}</div>
+         <div class="muted" style="word-break:break-all">${esc(g.one_time_token).slice(0,48)}…</div>`
+      : '<span class="muted">尚未同意</span>';
+    return `<tr>
+      <td>${r.id}</td><td>#${r.credential_id}</td><td>${esc(r.holder_id)}</td><td>${esc(r.verifier)}</td>
+      <td>${esc(r.purpose)}</td><td>${esc(r.requested_fields.join(','))}</td>
+      <td><span class="pill s-${r.status}">${r.status}</span></td>
+      <td class="muted">${esc(r.expires_at)}</td>
+      <td>${action}${grantInfo}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9" class="muted">暂无申请</td></tr>';
+}
+
+async function loadRecords(){
+  const data = await api('/api/verification/records', {headers: authHeaders()});
+  $('records').innerHTML = data.records.map(r =>
+    `<tr><td class="muted">${esc(r.verified_at)}</td><td>#${r.request_id}</td><td>${esc(r.verifier)}</td>
+     <td>${esc(r.purpose)}</td><td>${esc(r.disclosed_fields.map(f => f + '=' + r.disclosed_claims[f]).join('；'))}</td></tr>`
+  ).join('') || '<tr><td colspan="5" class="muted">暂无核验记录</td></tr>';
+}
+
+async function loadAll(){
+  try{ await Promise.all([loadState(), loadRequests(), loadRecords()]); }
+  catch(e){ alert(e.message); }
+}
+
+async function createRequest(){
+  try{
+    const body = {
+      credential_id: Number($('credential').value),
+      purpose: $('purpose').value.trim(),
+      fields: $('fields').value.split(',').map(s => s.trim()).filter(Boolean),
+      ttl_minutes: Number($('ttl').value || 30),
+    };
+    const r = await api('/api/verification/requests', {method:'POST', headers:authHeaders(), body:JSON.stringify(body)});
+    $('requestHint').textContent = `申请 #${r.id} 已登记，等待持有人 ${r.holder_id} 同意`;
+    await loadAll();
+  }catch(e){ alert(e.message); }
+}
+
+async function consent(id){
+  try{
+    const r = await api(`/api/verification/requests/${id}/consent`, {method:'POST', headers:authHeaders()});
+    $('token').value = r.one_time_token;
+    alert(`已同意申请 #${id}，一次性凭证已生成并填入兑付框（字段：${r.approved_fields.join(',')}）`);
+    await loadAll();
+  }catch(e){ alert(e.message); }
+}
+
+async function withdraw(id){
+  if(!confirm(`撤回申请 #${id}？未使用的一次性凭证将立即作废，已有的核验记录会继续保留。`)) return;
+  try{ await api(`/api/verification/requests/${id}/withdraw`, {method:'POST', headers:authHeaders()}); await loadAll(); }
+  catch(e){ alert(e.message); }
+}
+
+function useToken(id){
+  // 完整凭证在服务端状态中可取（持有人同意后生成，兑付成功即失效）
+  fetch('/api/state').then(r=>r.json()).then(s => {
+    const req = s.verification_requests.find(x => x.id === id);
+    if(req?.grant){ $('token').value = req.grant.one_time_token; $('redeemFields').value = req.grant.approved_fields.join(','); }
+  });
+}
+
+async function redeem(){
+  const fields = $('redeemFields').value.split(',').map(s=>s.trim()).filter(Boolean);
+  try{
+    const r = await api('/api/verification/redeem', {
+      method:'POST', headers:authHeaders(),
+      body: JSON.stringify({token: $('token').value.trim(), fields: fields.length ? fields : null}),
+    });
+    $('redeemResult').textContent = JSON.stringify(r, null, 2);
+    await loadAll();
+  }catch(e){ $('redeemResult').textContent = '核验被拒绝：' + e.message + (e.status ? `（HTTP ${e.status}）` : ''); }
+}
+
+loadAll();
+</script>
 </html>

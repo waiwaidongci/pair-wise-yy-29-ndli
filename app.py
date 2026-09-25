@@ -12,37 +12,17 @@ import secrets
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from common import ApiError, canonical, iso, now, parse_time
+from verification_persistence import VerificationRepository
+from verification_service import VerificationService
+from verification_state import GrantOccupancy
+
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
 
 
 class Store:
@@ -55,6 +35,7 @@ class Store:
         self.init_schema()
 
     def init_schema(self) -> None:
+        self.verifications = VerificationRepository(self.conn)
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS key_versions (
@@ -117,7 +98,7 @@ class Store:
             );
             """
         )
-        self.conn.commit()
+        self.verifications.init_schema()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute(
@@ -135,6 +116,7 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.verification = VerificationService(store.verifications, GrantOccupancy(), store.audit)
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -381,7 +363,9 @@ class CredentialService:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        state = {"templates": templates, "credentials": credentials, "audits": audits}
+        state.update(self.verification.public_state())
+        return state
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -392,6 +376,7 @@ class CredentialService:
 
 class Handler(BaseHTTPRequestHandler):
     service: CredentialService
+    verification: VerificationService
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -419,10 +404,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             parts = self._parts()
+            actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if parts == ["health"] or parts == ["api", "health"]:
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "verification", "requests"]:
+                return self._json(200, {"requests": self.verification.list_requests(actor, role)})
+            if parts == ["api", "verification", "records"]:
+                return self._json(200, {"records": self.verification.list_records(actor, role)})
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -458,6 +448,16 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
             elif parts == ["api", "verify"]:
                 result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+            elif parts == ["api", "verification", "requests"]:
+                result = self.verification.create_request(
+                    actor, role, int(body.get("credential_id", 0)), body.get("purpose", ""), body.get("fields", []), body.get("ttl_minutes")
+                )
+            elif len(parts) == 5 and parts[:3] == ["api", "verification", "requests"] and parts[4] == "consent":
+                result = self.verification.consent(actor, role, int(parts[3]))
+            elif len(parts) == 5 and parts[:3] == ["api", "verification", "requests"] and parts[4] == "withdraw":
+                result = self.verification.withdraw(actor, role, int(parts[3]))
+            elif parts == ["api", "verification", "redeem"]:
+                result = self.verification.redeem(actor, role, body.get("token", ""), body.get("fields"))
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)
@@ -475,6 +475,7 @@ def run(port: int, db_path: str, seed: bool) -> None:
     if seed:
         service.seed()
     Handler.service = service
+    Handler.verification = service.verification
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"digital credentials listening on http://127.0.0.1:{port}")
     server.serve_forever()
