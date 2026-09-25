@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal standards-library digital credential service for local evaluation."""
+"""Minimal standards-library digital credential service for local evaluation.
+
+分层：
+- persistence.py  ：SQLite 持久化（密钥、模板、凭证、争议、核验申请/记录、审计）；
+- occupancy.py    ：进程内占用状态，串行化同笔申请的并发取用；
+- verification.py ：核验申请、持有人同意与一次性结果凭证的请求处理；
+- app.py         ：HTTP 路由与凭证签发/撤销/争议业务。
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,126 +14,17 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import sqlite3
 import sys
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-class Store:
-    def __init__(self, path: str | os.PathLike[str] = DB_PATH):
-        self.path = str(path)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.init_schema()
-
-    def init_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS key_versions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              issuer TEXT NOT NULL,
-              version INTEGER NOT NULL,
-              secret_hex TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('active','retired')),
-              created_at TEXT NOT NULL,
-              retired_at TEXT,
-              UNIQUE(issuer, version)
-            );
-            CREATE TABLE IF NOT EXISTS templates (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              issuer TEXT NOT NULL,
-              code TEXT NOT NULL,
-              name TEXT NOT NULL,
-              fields_json TEXT NOT NULL,
-              validity_days INTEGER NOT NULL CHECK(validity_days BETWEEN 1 AND 3650),
-              status TEXT NOT NULL CHECK(status IN ('active','disabled')),
-              created_at TEXT NOT NULL,
-              UNIQUE(issuer, code)
-            );
-            CREATE TABLE IF NOT EXISTS credentials (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              template_id INTEGER NOT NULL REFERENCES templates(id),
-              issuer TEXT NOT NULL,
-              holder_id TEXT NOT NULL,
-              claims_json TEXT NOT NULL,
-              issued_at TEXT NOT NULL,
-              valid_until TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('active','revoked','disputed')),
-              key_version INTEGER NOT NULL,
-              idempotency_key TEXT NOT NULL,
-              revocation_reason TEXT,
-              revocation_effective_at TEXT,
-              UNIQUE(template_id, holder_id, idempotency_key)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_live_credential
-              ON credentials(template_id, holder_id)
-              WHERE status IN ('active','disputed');
-            CREATE TABLE IF NOT EXISTS disputes (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              credential_id INTEGER NOT NULL REFERENCES credentials(id),
-              raised_by TEXT NOT NULL,
-              reason TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('open','upheld','rejected')),
-              resolution TEXT,
-              created_at TEXT NOT NULL,
-              resolved_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              at TEXT NOT NULL,
-              actor TEXT NOT NULL,
-              action TEXT NOT NULL,
-              entity_type TEXT NOT NULL,
-              entity_id TEXT NOT NULL,
-              details_json TEXT NOT NULL
-            );
-            """
-        )
-        self.conn.commit()
-
-    def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
-        self.conn.execute(
-            "INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
-            (iso(), actor, action, entity_type, str(entity_id), json.dumps(details, ensure_ascii=False)),
-        )
-
-    def close(self) -> None:
-        self.conn.close()
+from occupancy import OccupancyRegistry
+from persistence import DB_PATH, ApiError, Store, canonical, iso, now, parse_time
+from verification import VerificationService
 
 
 class CredentialService:
@@ -162,7 +60,7 @@ class CredentialService:
         actor = self._required_actor(actor, role, "issuer")
         if actor != issuer:
             raise ApiError(403, "只能轮换自己的密钥")
-        with self.conn:
+        with self.store.transaction():
             old = self.conn.execute("SELECT * FROM key_versions WHERE issuer=? AND status='active'", (issuer,)).fetchone()
             version = 1
             if old:
@@ -191,7 +89,7 @@ class CredentialService:
         if not normalized:
             raise ApiError(400, "模板至少需要一个字段")
         try:
-            with self.conn:
+            with self.store.transaction():
                 cur = self.conn.execute(
                     "INSERT INTO templates(issuer,code,name,fields_json,validity_days,status,created_at) VALUES(?,?,?,?,?,'active',?)",
                     (actor, code, name, json.dumps(normalized, ensure_ascii=False), int(validity_days), iso()),
@@ -233,7 +131,7 @@ class CredentialService:
             raise ApiError(400, "有效期必须晚于签发时间")
         key = self._active_key(actor)
         try:
-            with self.conn:
+            with self.store.transaction():
                 cur = self.conn.execute(
                     """INSERT INTO credentials(template_id,issuer,holder_id,claims_json,issued_at,valid_until,status,key_version,idempotency_key)
                        VALUES(?,?,?,?,?,?, 'active',?,?)""",
@@ -254,7 +152,7 @@ class CredentialService:
                 return self._credential_dict(credential)
             raise ApiError(409, "凭证已经撤销")
         effective = parse_time(effective_at) if effective_at else now()
-        with self.conn:
+        with self.store.transaction():
             self.conn.execute(
                 "UPDATE credentials SET status='revoked',revocation_reason=?,revocation_effective_at=? WHERE id=?",
                 (reason, iso(effective), credential_id),
@@ -272,7 +170,7 @@ class CredentialService:
         open_dispute = self.conn.execute("SELECT id FROM disputes WHERE credential_id=? AND status='open'", (credential_id,)).fetchone()
         if open_dispute:
             raise ApiError(409, "已有待处理争议")
-        with self.conn:
+        with self.store.transaction():
             cur = self.conn.execute(
                 "INSERT INTO disputes(credential_id,raised_by,reason,status,created_at) VALUES(?,?,?,'open',?)",
                 (credential_id, actor, reason, iso()),
@@ -293,7 +191,7 @@ class CredentialService:
             raise ApiError(409, "凭证状态与争议不一致")
         new_status = "revoked" if decision == "uphold" else "active"
         dispute_status = "upheld" if decision == "uphold" else "rejected"
-        with self.conn:
+        with self.store.transaction():
             self.conn.execute("UPDATE disputes SET status=?,resolution=?,resolved_at=? WHERE id=?", (dispute_status, resolution, iso(), dispute_id))
             self.conn.execute("UPDATE credentials SET status=? WHERE id=?", (new_status, credential["id"]))
             self.store.audit(actor, "dispute.resolve", "dispute", dispute_id, {"decision": decision, "credential_status": new_status})
@@ -326,7 +224,6 @@ class CredentialService:
         signature = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
         token = base64.urlsafe_b64encode(canonical({"payload": payload, "signature": signature})).decode().rstrip("=")
         self.store.audit(actor, "credential.present", "credential", credential_id, {"disclosed_fields": disclosed})
-        self.conn.commit()
         return {"token": token, "payload": payload, "signature": signature, "disclosed_fields": disclosed}
 
     def verify(self, token: str, at: str | None = None, online: bool = True) -> dict:
@@ -366,7 +263,6 @@ class CredentialService:
             result["revocation_freshness"] = "needs_online_check"
             if result["valid"]:
                 result["status"] = "valid_offline"
-        self.conn.commit()
         return result
 
     def _credential_dict(self, row: sqlite3.Row) -> dict:
@@ -379,7 +275,12 @@ class CredentialService:
 
     def state(self) -> dict:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
-        templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
+        templates = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC"
+            )
+        ]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
         return {"templates": templates, "credentials": credentials, "audits": audits}
 
@@ -388,10 +289,19 @@ class CredentialService:
             self.rotate_key("issuer-demo", "issuer", "issuer-demo")
         if not self.conn.execute("SELECT id FROM templates LIMIT 1").fetchone():
             self.create_template("issuer-demo", "issuer", "student-v1", "学生身份", [{"name": "name", "required": True}, {"name": "program", "required": True}, {"name": "degree", "required": False}], 365)
+        if not self.conn.execute("SELECT id FROM credentials WHERE holder_id='alice'").fetchone():
+            templates = self.conn.execute("SELECT id FROM templates WHERE code='student-v1'").fetchall()
+            if templates:
+                self.issue(
+                    "issuer-demo", "issuer", templates[0]["id"], "alice",
+                    {"name": "Alice", "program": "计算机科学", "degree": "本科在读"}, "seed-alice",
+                )
 
 
 class Handler(BaseHTTPRequestHandler):
     service: CredentialService
+    verification: VerificationService
+    occupancy: OccupancyRegistry
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -416,13 +326,30 @@ class Handler(BaseHTTPRequestHandler):
     def _parts(self) -> list[str]:
         return [part for part in urlparse(self.path).path.strip("/").split("/") if part]
 
+    def _identity(self) -> tuple[str | None, str | None]:
+        return self.headers.get("X-Actor"), self.headers.get("X-Role")
+
     def do_GET(self) -> None:
         try:
-            parts = self._parts()
+            parsed = urlparse(self.path)
+            parts = [part for part in parsed.path.strip("/").split("/") if part]
+            actor, role = self._identity()
             if parts == ["health"] or parts == ["api", "health"]:
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
-                return self._json(200, self.service.state())
+                body = self.service.state()
+                body["verification_requests"] = self.verification.list_requests(actor, role) if actor else []
+                body["verification_records"] = self.verification.list_records(actor, role) if actor else []
+                body["occupancy"] = {"busy_request_ids": self.occupancy.busy_keys()}
+                return self._json(200, body)
+            if parts == ["api", "verification", "requests"]:
+                return self._json(200, {"requests": self.verification.list_requests(actor, role)})
+            if len(parts) == 4 and parts[:3] == ["api", "verification", "requests"]:
+                return self._json(200, self.verification.get_request(actor, role, int(parts[3])))
+            if parts == ["api", "verification", "records"]:
+                query = parse_qs(parsed.query)
+                credential_id = int(query["credential_id"][0]) if query.get("credential_id") else None
+                return self._json(200, {"records": self.verification.list_records(actor, role, credential_id)})
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -441,25 +368,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parts = self._parts()
             body = self._body()
-            actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
-            if parts == ["api", "keys", "rotate"]:
-                result = self.service.rotate_key(actor, role, body.get("issuer", actor or ""))
-            elif parts == ["api", "templates"]:
-                result = self.service.create_template(actor, role, body.get("code", ""), body.get("name", ""), body.get("fields", []), int(body.get("validity_days", 1)))
-            elif parts == ["api", "credentials"]:
-                result = self.service.issue(actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""), body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"))
-            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
-                result = self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
-            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
-                result = self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
-            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
-                result = self.service.present(actor, role, int(parts[2]), body.get("disclosed_fields"))
-            elif len(parts) == 4 and parts[:2] == ["api", "disputes"] and parts[3] == "resolve":
-                result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
-            elif parts == ["api", "verify"]:
-                result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
-            else:
-                raise ApiError(404, "接口不存在")
+            actor, role = self._identity()
+            result = self._route(parts, body, actor, role)
             self._json(200, result)
         except ApiError as exc:
             self._json(exc.status, {"error": exc.message})
@@ -468,13 +378,61 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
+    def _route(self, parts: list[str], body: dict, actor: str | None, role: str | None) -> dict:
+        if parts == ["api", "keys", "rotate"]:
+            return self.service.rotate_key(actor, role, body.get("issuer", actor or ""))
+        if parts == ["api", "templates"]:
+            return self.service.create_template(
+                actor, role, body.get("code", ""), body.get("name", ""),
+                body.get("fields", []), int(body.get("validity_days", 1)),
+            )
+        if parts == ["api", "credentials"]:
+            return self.service.issue(
+                actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""),
+                body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"),
+            )
+        if len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
+            return self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+        if len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
+            return self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
+        if len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
+            return self.service.present(actor, role, int(parts[2]), body.get("disclosed_fields"))
+        if len(parts) == 4 and parts[:2] == ["api", "disputes"] and parts[3] == "resolve":
+            return self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
+        if parts == ["api", "verify"]:
+            return self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+        # ---- 核验申请与一次性出示 ----
+        if parts == ["api", "verification", "requests"]:
+            return self.verification.create_request(
+                actor, role, int(body.get("credential_id", 0)),
+                body.get("purpose", ""), body.get("requested_fields", []),
+            )
+        if len(parts) == 5 and parts[:3] == ["api", "verification", "requests"]:
+            request_id = int(parts[3])
+            if parts[4] == "approve":
+                return self.verification.approve_request(
+                    actor, role, request_id, body.get("approved_fields"), body.get("ttl_seconds"),
+                )
+            if parts[4] == "withdraw":
+                return self.verification.withdraw_consent(actor, role, request_id)
+        if parts == ["api", "verification", "redeem"]:
+            return self.verification.redeem_voucher(
+                actor, role, body.get("voucher_token", body.get("token", "")),
+                body.get("fields"), body.get("at"),
+            )
+        raise ApiError(404, "接口不存在")
+
 
 def run(port: int, db_path: str, seed: bool) -> None:
     store = Store(db_path)
     service = CredentialService(store)
+    occupancy = OccupancyRegistry()
+    verification = VerificationService(store, occupancy)
     if seed:
         service.seed()
     Handler.service = service
+    Handler.verification = verification
+    Handler.occupancy = occupancy
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"digital credentials listening on http://127.0.0.1:{port}")
     server.serve_forever()
